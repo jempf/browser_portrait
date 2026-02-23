@@ -95,7 +95,7 @@ def train_one_epoch(
     equivariance_loss: KeypointEquivarianceLoss,
     device: torch.device,
     epoch: int,
-    writer: SummaryWriter,
+    writer: SummaryWriter | None,
     max_batches: int = 0,
 ) -> Dict[str, float]:
     model.train()
@@ -130,15 +130,16 @@ def train_one_epoch(
         num_batches += 1
         step = global_step + batch_idx
         if batch_idx % log_interval == 0:
-            writer.add_scalar('train/loss', loss.item(), step)
-            writer.add_scalar('train/l1', l1.item(), step)
-            writer.add_scalar('train/perceptual', perc.item(), step)
-            writer.add_scalar('train/equivariance', equiv.item(), step)
+            if writer:
+                writer.add_scalar('train/loss', loss.item(), step)
+                writer.add_scalar('train/l1', l1.item(), step)
+                writer.add_scalar('train/perceptual', perc.item(), step)
+                writer.add_scalar('train/equivariance', equiv.item(), step)
             print(f'  [{batch_idx}/{effective_len}] '
                   f'loss={loss.item():.4f} l1={l1.item():.4f} '
                   f'perc={perc.item():.4f} equiv={equiv.item():.4f}',
                   flush=True)
-        if batch_idx % 500 == 0 and batch_idx > 0:
+        if writer and batch_idx % 500 == 0 and batch_idx > 0:
             writer.add_images('train/source', (source[:4] + 1) / 2, step)
             writer.add_images('train/driving', (driving[:4] + 1) / 2, step)
             writer.add_images('train/generated', (generated[:4].clamp(-1, 1) + 1) / 2, step)
@@ -216,7 +217,11 @@ def main() -> None:
         print(f'Resumed from epoch {start_epoch}')
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    writer = SummaryWriter(args.log_dir)
+    try:
+        writer = SummaryWriter(args.log_dir)
+    except OSError:
+        print('WARNING: TensorBoard logging disabled (disk issue)')
+        writer = None
 
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
@@ -229,8 +234,9 @@ def main() -> None:
         elapsed = time.time() - t0
         print(f'  Epoch complete in {elapsed:.1f}s — '
               f'loss={metrics["loss"]:.4f} l1={metrics["l1"]:.4f}')
-        writer.add_scalar('epoch/loss', metrics['loss'], epoch)
-        writer.add_scalar('epoch/lr', scheduler.get_last_lr()[0], epoch)
+        if writer:
+            writer.add_scalar('epoch/loss', metrics['loss'], epoch)
+            writer.add_scalar('epoch/lr', scheduler.get_last_lr()[0], epoch)
 
         if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
             checkpoint_path = os.path.join(args.checkpoint_dir, f'checkpoint_{epoch + 1}.pt')
@@ -242,7 +248,8 @@ def main() -> None:
             }, checkpoint_path)
             print(f'  Saved {checkpoint_path}')
 
-    writer.close()
+    if writer:
+        writer.close()
     print('\nTraining complete!')
     print(f'Export to ONNX: python export_onnx.py --checkpoint {args.checkpoint_dir}/checkpoint_{args.epochs}.pt')
 
