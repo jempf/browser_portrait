@@ -64,8 +64,8 @@ echo ""
 
 # --- Step 2: Download HDTF ---
 if [[ -z "${SKIP_DOWNLOAD:-}" ]]; then
-  echo "[2/5] Downloading HDTF dataset ($MAX_VIDEOS videos)..."
-  python download_hdtf.py --output-dir "$DATA_DIR" --max-videos "$MAX_VIDEOS"
+  echo "[2/5] Downloading HDTF dataset from HuggingFace..."
+  python download_hdtf_hf.py --output-dir "$DATA_DIR"
   echo ""
 else
   echo "[2/5] Skipping download (--skip-download)"
