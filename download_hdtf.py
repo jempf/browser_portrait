@@ -87,6 +87,9 @@ def parse_annotations() -> List[Dict]:
     return queue
 
 
+COOKIES_FILE = os.path.join(os.path.dirname(__file__), 'cookies.txt')
+
+
 def download_video(video_id: str, output_path: str, resolution: int) -> bool:
     """Download a YouTube video using yt-dlp."""
     if os.path.exists(output_path):
@@ -102,6 +105,9 @@ def download_video(video_id: str, output_path: str, resolution: int) -> bool:
         '-o', output_path,
         f'https://www.youtube.com/watch?v={video_id}',
     ]
+    if os.path.exists(COOKIES_FILE):
+        cmd.insert(3, '--cookies')
+        cmd.insert(4, COOKIES_FILE)
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f'    yt-dlp failed: {result.stderr[:200]}')
