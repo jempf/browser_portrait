@@ -95,7 +95,7 @@ def download_video(video_id: str, output_path: str, resolution: int) -> bool:
     if os.path.exists(output_path):
         print(f'    Already downloaded: {output_path}')
         return True
-    format_spec = f'bestvideo[height<={resolution}][ext=mp4]+bestaudio[ext=m4a]/best[height<={resolution}][ext=mp4]/best'
+    format_spec = f'bestvideo[height<={resolution}]+bestaudio/best[height<={resolution}]/bestvideo+bestaudio/best'
     yt_dlp_bin = os.environ.get('YT_DLP_BIN', 'yt-dlp')
     cmd = [
         yt_dlp_bin,
