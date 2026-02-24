@@ -20,13 +20,13 @@ Usage:
 import argparse
 import os
 import signal
-import sys
 import time
 from typing import Dict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import models
@@ -39,7 +39,7 @@ SAVE_INTERVAL_MINUTES = 30
 
 
 class PerceptualLoss(nn.Module):
-    """VGG-based perceptual loss for realistic image generation."""
+    """VGG-based perceptual loss. Target features computed without gradients."""
 
     def __init__(self):
         super().__init__()
@@ -55,11 +55,15 @@ class PerceptualLoss(nn.Module):
     def forward(self, predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         loss = torch.tensor(0.0, device=predicted.device)
         x = predicted
-        y = target
-        for layer in self.layers:
+        with torch.no_grad():
+            target_features = []
+            y = target
+            for layer in self.layers:
+                y = layer(y)
+                target_features.append(y)
+        for i, layer in enumerate(self.layers):
             x = layer(x)
-            y = layer(y)
-            loss = loss + F.l1_loss(x, y)
+            loss = loss + F.l1_loss(x, target_features[i])
         return loss
 
 
@@ -95,6 +99,7 @@ class KeypointEquivarianceLoss(nn.Module):
 def save_checkpoint(
     model: MobilePortraitModel,
     optimizer: torch.optim.Optimizer,
+    scaler: GradScaler | None,
     epoch: int,
     batch_idx: int,
     metrics: Dict[str, float],
@@ -102,13 +107,16 @@ def save_checkpoint(
     label: str = 'latest',
 ) -> str:
     path = os.path.join(checkpoint_dir, f'checkpoint_{label}.pt')
-    torch.save({
+    state = {
         'epoch': epoch,
         'batch_idx': batch_idx,
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'metrics': metrics,
-    }, path)
+    }
+    if scaler is not None:
+        state['scaler'] = scaler.state_dict()
+    torch.save(state, path)
     return path
 
 
@@ -129,6 +137,10 @@ def main() -> None:
                         help='Limit batches per epoch (0 = no limit)')
     parser.add_argument('--save-interval-min', type=int, default=SAVE_INTERVAL_MINUTES,
                         help='Save checkpoint every N minutes regardless of epoch')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable mixed precision training')
+    parser.add_argument('--no-grad-checkpoint', action='store_true',
+                        help='Disable gradient checkpointing')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -141,6 +153,11 @@ def main() -> None:
     else:
         device = torch.device(args.device)
     print(f'Device: {device}')
+
+    use_amp = device.type == 'cuda' and not args.no_amp
+    use_grad_ckpt = not args.no_grad_checkpoint
+    print(f'Mixed precision (AMP): {use_amp}')
+    print(f'Gradient checkpointing: {use_grad_ckpt}')
 
     dataset = TalkingHeadDataset(data_root=args.data_root, image_size=256)
     print(f'Dataset: {len(dataset)} frames from {len(dataset.videos)} videos')
@@ -161,18 +178,23 @@ def main() -> None:
     )
 
     model = MobilePortraitModel().to(device)
+    if use_grad_ckpt:
+        model.enable_gradient_checkpointing()
     print(f'Model: {count_parameters(model):,} parameters')
 
     perceptual = PerceptualLoss().to(device)
     equivariance = KeypointEquivarianceLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    scaler = GradScaler(enabled=use_amp)
     start_epoch = 0
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scaler' in checkpoint and use_amp:
+            scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint.get('epoch', 0) + 1
         print(f'Resumed from epoch {start_epoch}')
 
@@ -226,16 +248,21 @@ def main() -> None:
 
             source = source.to(device)
             driving = driving.to(device)
-            output = model(source, driving)
-            generated = output['output']
-            l1 = F.l1_loss(generated, driving)
-            perc = perceptual(generated, driving) * 0.1
-            equiv = equivariance(model.motion, source) * 0.05
-            loss = l1 + perc + equiv
+
+            with autocast(enabled=use_amp):
+                output = model(source, driving)
+                generated = output['output']
+                l1 = F.l1_loss(generated, driving)
+                perc = perceptual(generated, driving) * 0.1
+                equiv = equivariance(model.motion, source) * 0.05
+                loss = l1 + perc + equiv
+
             optimizer.zero_grad()
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             total_loss += loss.item()
             total_l1 += l1.item()
@@ -261,7 +288,7 @@ def main() -> None:
             now = time.time()
             if (now - last_save_time) > args.save_interval_min * 60:
                 metrics = {'loss': total_loss / max(1, num_batches), 'l1': total_l1 / max(1, num_batches)}
-                path = save_checkpoint(model, optimizer, epoch, batch_idx, metrics, args.checkpoint_dir, 'latest')
+                path = save_checkpoint(model, optimizer, scaler, epoch, batch_idx, metrics, args.checkpoint_dir, 'latest')
                 last_save_time = now
                 print(f'  [auto-save] {path} (epoch {epoch+1}, batch {batch_idx})', flush=True)
 
@@ -280,16 +307,16 @@ def main() -> None:
             writer.add_scalar('epoch/loss', metrics['loss'], epoch)
             writer.add_scalar('epoch/lr', scheduler.get_last_lr()[0], epoch)
 
-        save_checkpoint(model, optimizer, epoch, 0, metrics, args.checkpoint_dir, 'latest')
+        save_checkpoint(model, optimizer, scaler, epoch, 0, metrics, args.checkpoint_dir, 'latest')
         last_save_time = time.time()
 
         if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
-            save_checkpoint(model, optimizer, epoch, 0, metrics, args.checkpoint_dir, f'{epoch + 1}')
+            save_checkpoint(model, optimizer, scaler, epoch, 0, metrics, args.checkpoint_dir, f'{epoch + 1}')
             print(f'  Saved checkpoint_{epoch + 1}.pt')
 
     if interrupted:
         metrics = {'loss': total_loss / max(1, num_batches), 'l1': total_l1 / max(1, num_batches)}
-        path = save_checkpoint(model, optimizer, epoch, batch_idx, metrics, args.checkpoint_dir, 'interrupted')
+        path = save_checkpoint(model, optimizer, scaler, epoch, batch_idx, metrics, args.checkpoint_dir, 'interrupted')
         print(f'  Saved interrupted checkpoint: {path}')
 
     if writer:

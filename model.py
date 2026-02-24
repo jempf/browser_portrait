@@ -19,6 +19,7 @@ Models produced:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from typing import Dict, Tuple
 
 
@@ -106,12 +107,18 @@ class AppearanceExtractor(nn.Module):
             ResBlock(base_ch * 8),
             ResBlock(base_ch * 8),
         )
+        self.use_checkpointing = False
 
     def forward(self, img: torch.Tensor) -> torch.Tensor:
-        x0 = self.stem(img)       # [B, 32, 256, 256]
-        x1 = self.down1(x0)       # [B, 64, 128, 128]
-        x2 = self.down2(x1)       # [B, 128, 64, 64]
-        x3 = self.down3(x2)       # [B, 256, 32, 32]
+        x0 = self.stem(img)
+        if self.use_checkpointing and self.training:
+            x1 = grad_checkpoint(self.down1, x0, use_reentrant=False)
+            x2 = grad_checkpoint(self.down2, x1, use_reentrant=False)
+            x3 = grad_checkpoint(self.down3, x2, use_reentrant=False)
+            return grad_checkpoint(self.bottleneck, x3, use_reentrant=False)
+        x1 = self.down1(x0)
+        x2 = self.down2(x1)
+        x3 = self.down3(x2)
         return self.bottleneck(x3)
 
 
@@ -150,9 +157,13 @@ class MotionExtractor(nn.Module):
         self.rotation_head = nn.Linear(enc_ch, 6)
         self.translation_head = nn.Linear(enc_ch, 3)
         self.scale_head = nn.Linear(enc_ch, 1)
+        self.use_checkpointing = False
 
     def forward(self, img: torch.Tensor) -> Dict[str, torch.Tensor]:
-        feat = self.encoder(img)
+        if self.use_checkpointing and self.training:
+            feat = grad_checkpoint(self.encoder, img, use_reentrant=False)
+        else:
+            feat = self.encoder(img)
         feat = self.pool(feat).flatten(1)
         b = feat.shape[0]
         kp = self.kp_head(feat).reshape(b, TOTAL_KP, KP_DIM)
@@ -300,13 +311,17 @@ class WarpingGenerator(nn.Module):
     def __init__(self, feat_ch: int = 256, base_ch: int = 64):
         super().__init__()
         self.motion = DenseMotionEstimator(feat_ch)
-        self.decoder = nn.Sequential(
-            UpBlock(feat_ch, 0, base_ch * 4),
-            UpBlock(base_ch * 4, 0, base_ch * 2),
-            UpBlock(base_ch * 2, 0, base_ch),
-            nn.Conv2d(base_ch, 3, 3, 1, 1),
-            nn.Tanh(),
-        )
+        self.up1 = UpBlock(feat_ch, 0, base_ch * 4)
+        self.up2 = UpBlock(base_ch * 4, 0, base_ch * 2)
+        self.up3 = UpBlock(base_ch * 2, 0, base_ch)
+        self.to_rgb = nn.Sequential(nn.Conv2d(base_ch, 3, 3, 1, 1), nn.Tanh())
+        self.use_checkpointing = False
+
+    def _decode(self, warped: torch.Tensor) -> torch.Tensor:
+        x = self.up1(warped)
+        x = self.up2(x)
+        x = self.up3(x)
+        return self.to_rgb(x)
 
     def forward(
         self,
@@ -317,7 +332,9 @@ class WarpingGenerator(nn.Module):
         flow, occlusion = self.motion(features, kp_source, kp_driving)
         warped = self._warp_features(features, flow)
         warped = warped * occlusion
-        return self.decoder(warped)
+        if self.use_checkpointing and self.training:
+            return grad_checkpoint(self._decode, warped, use_reentrant=False)
+        return self._decode(warped)
 
     @staticmethod
     def _warp_features(features: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -386,6 +403,12 @@ class MobilePortraitModel(nn.Module):
         self.audio_to_motion = AudioToMotion(audio_dim)
         self.generator = WarpingGenerator(feat_ch=base_ch * 8, base_ch=base_ch * 2)
         self.stitching = StitchingModule()
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Trade ~25% compute for ~60-70% less activation memory."""
+        self.appearance.use_checkpointing = True
+        self.motion.use_checkpointing = True
+        self.generator.use_checkpointing = True
 
     def forward(
         self,
