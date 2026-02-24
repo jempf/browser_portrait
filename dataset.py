@@ -75,17 +75,22 @@ class TalkingHeadDataset(Dataset):
         return sum(len(frames) for _, frames in self.videos)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        video_idx, frames = self._index_to_video(idx)
-        video_dir, frame_list = self.videos[video_idx]
-        source_idx = random.randint(0, len(frame_list) - 1)
-        gap = min(self.max_frame_gap, len(frame_list) - 1)
-        driving_idx = random.randint(
-            max(0, source_idx - gap),
-            min(len(frame_list) - 1, source_idx + gap),
-        )
-        source_img = self._load_frame(video_dir / frame_list[source_idx])
-        driving_img = self._load_frame(video_dir / frame_list[driving_idx])
-        return source_img, driving_img
+        for _ in range(10):
+            try:
+                video_idx, frames = self._index_to_video(idx)
+                video_dir, frame_list = self.videos[video_idx]
+                source_idx = random.randint(0, len(frame_list) - 1)
+                gap = min(self.max_frame_gap, len(frame_list) - 1)
+                driving_idx = random.randint(
+                    max(0, source_idx - gap),
+                    min(len(frame_list) - 1, source_idx + gap),
+                )
+                source_img = self._load_frame(video_dir / frame_list[source_idx])
+                driving_img = self._load_frame(video_dir / frame_list[driving_idx])
+                return source_img, driving_img
+            except (OSError, SyntaxError):
+                idx = random.randint(0, len(self) - 1)
+        return self._fallback_sample()
 
     def _index_to_video(self, idx: int) -> Tuple[int, list[str]]:
         cumulative = 0
@@ -94,6 +99,11 @@ class TalkingHeadDataset(Dataset):
             if idx < cumulative:
                 return i, frames
         return len(self.videos) - 1, self.videos[-1][1]
+
+    def _fallback_sample(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return a blank sample if all retries fail."""
+        blank = torch.zeros(3, self.image_size, self.image_size)
+        return blank, blank
 
     def _load_frame(self, path: Path) -> torch.Tensor:
         img = Image.open(path).convert('RGB')
