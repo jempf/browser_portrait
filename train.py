@@ -14,11 +14,13 @@ Losses:
 
 Usage:
   python train.py --data-root ./data/hdtf --epochs 100 --batch-size 8
-  python train.py --data-root ./data/hdtf --resume checkpoint_50.pt
+  python train.py --data-root ./data/hdtf --resume checkpoint_latest.pt
 """
 
 import argparse
 import os
+import signal
+import sys
 import time
 from typing import Dict
 
@@ -31,6 +33,9 @@ from torchvision import models
 
 from model import MobilePortraitModel, count_parameters
 from dataset import TalkingHeadDataset
+
+
+SAVE_INTERVAL_MINUTES = 30
 
 
 class PerceptualLoss(nn.Module):
@@ -87,69 +92,24 @@ class KeypointEquivarianceLoss(nn.Module):
         return F.l1_loss(kp_transformed, kp_expected)
 
 
-def train_one_epoch(
+def save_checkpoint(
     model: MobilePortraitModel,
-    dataloader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    perceptual_loss: PerceptualLoss,
-    equivariance_loss: KeypointEquivarianceLoss,
-    device: torch.device,
     epoch: int,
-    writer: SummaryWriter | None,
-    max_batches: int = 0,
-) -> Dict[str, float]:
-    model.train()
-    total_loss = 0.0
-    total_l1 = 0.0
-    total_perc = 0.0
-    total_equiv = 0.0
-    num_batches = 0
-    effective_len = max_batches if max_batches > 0 else len(dataloader)
-    global_step = epoch * effective_len
-    log_interval = max(1, effective_len // 20)
-
-    for batch_idx, (source, driving) in enumerate(dataloader):
-        if max_batches > 0 and batch_idx >= max_batches:
-            break
-        source = source.to(device)
-        driving = driving.to(device)
-        output = model(source, driving)
-        generated = output['output']
-        l1 = F.l1_loss(generated, driving)
-        perc = perceptual_loss(generated, driving) * 0.1
-        equiv = equivariance_loss(model.motion, source) * 0.05
-        loss = l1 + perc + equiv
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
-        total_loss += loss.item()
-        total_l1 += l1.item()
-        total_perc += perc.item()
-        total_equiv += equiv.item()
-        num_batches += 1
-        step = global_step + batch_idx
-        if batch_idx % log_interval == 0:
-            if writer:
-                writer.add_scalar('train/loss', loss.item(), step)
-                writer.add_scalar('train/l1', l1.item(), step)
-                writer.add_scalar('train/perceptual', perc.item(), step)
-                writer.add_scalar('train/equivariance', equiv.item(), step)
-            print(f'  [{batch_idx}/{effective_len}] '
-                  f'loss={loss.item():.4f} l1={l1.item():.4f} '
-                  f'perc={perc.item():.4f} equiv={equiv.item():.4f}',
-                  flush=True)
-        if writer and batch_idx % 500 == 0 and batch_idx > 0:
-            writer.add_images('train/source', (source[:4] + 1) / 2, step)
-            writer.add_images('train/driving', (driving[:4] + 1) / 2, step)
-            writer.add_images('train/generated', (generated[:4].clamp(-1, 1) + 1) / 2, step)
-
-    return {
-        'loss': total_loss / max(1, num_batches),
-        'l1': total_l1 / max(1, num_batches),
-        'perceptual': total_perc / max(1, num_batches),
-        'equivariance': total_equiv / max(1, num_batches),
-    }
+    batch_idx: int,
+    metrics: Dict[str, float],
+    checkpoint_dir: str,
+    label: str = 'latest',
+) -> str:
+    path = os.path.join(checkpoint_dir, f'checkpoint_{label}.pt')
+    torch.save({
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'model': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'metrics': metrics,
+    }, path)
+    return path
 
 
 def main() -> None:
@@ -162,12 +122,13 @@ def main() -> None:
     parser.add_argument('--log-dir', type=str, default='./runs')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--save-every', type=int, default=10)
+    parser.add_argument('--save-every', type=int, default=5)
     parser.add_argument('--device', type=str, default='auto',
-                        choices=['auto', 'cpu', 'cuda', 'mps'],
-                        help='Device to train on (auto selects best available)')
+                        choices=['auto', 'cpu', 'cuda', 'mps'])
     parser.add_argument('--max-batches', type=int, default=0,
-                        help='Limit batches per epoch (0 = no limit, useful for test runs)')
+                        help='Limit batches per epoch (0 = no limit)')
+    parser.add_argument('--save-interval-min', type=int, default=SAVE_INTERVAL_MINUTES,
+                        help='Save checkpoint every N minutes regardless of epoch')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -185,8 +146,7 @@ def main() -> None:
     print(f'Dataset: {len(dataset)} frames from {len(dataset.videos)} videos')
 
     if len(dataset) == 0:
-        print('ERROR: No training data found. Expected layout:')
-        print(f'  {args.data_root}/video_001/frame_0001.jpg')
+        print('ERROR: No training data found.')
         return
 
     use_pin_memory = device.type == 'cuda'
@@ -223,35 +183,123 @@ def main() -> None:
         print('WARNING: TensorBoard logging disabled (disk issue)')
         writer = None
 
+    interrupted = False
+
+    def handle_signal(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+        print('\n*** Interrupt received, saving checkpoint... ***', flush=True)
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    last_save_time = time.time()
+    training_start = time.time()
+    total_batches_done = 0
+    batches_per_epoch = args.max_batches if args.max_batches > 0 else len(dataloader)
+    log_interval = max(1, batches_per_epoch // 20)
+
+    print(f'\nBatches per epoch: {batches_per_epoch}')
+    print(f'Log every {log_interval} batches')
+    print(f'Auto-save every {args.save_interval_min} minutes')
+    print(f'Checkpoint saves at epochs: every {args.save_every}')
+
     for epoch in range(start_epoch, args.epochs):
+        if interrupted:
+            break
+
         t0 = time.time()
+        model.train()
+        total_loss = 0.0
+        total_l1 = 0.0
+        total_perc = 0.0
+        total_equiv = 0.0
+        num_batches = 0
+
         print(f'\nEpoch {epoch + 1}/{args.epochs} (lr={scheduler.get_last_lr()[0]:.6f})')
-        metrics = train_one_epoch(
-            model, dataloader, optimizer, perceptual, equivariance,
-            device, epoch, writer, max_batches=args.max_batches,
-        )
+
+        for batch_idx, (source, driving) in enumerate(dataloader):
+            if interrupted:
+                break
+            if args.max_batches > 0 and batch_idx >= args.max_batches:
+                break
+
+            source = source.to(device)
+            driving = driving.to(device)
+            output = model(source, driving)
+            generated = output['output']
+            l1 = F.l1_loss(generated, driving)
+            perc = perceptual(generated, driving) * 0.1
+            equiv = equivariance(model.motion, source) * 0.05
+            loss = l1 + perc + equiv
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+
+            total_loss += loss.item()
+            total_l1 += l1.item()
+            total_perc += perc.item()
+            total_equiv += equiv.item()
+            num_batches += 1
+            total_batches_done += 1
+
+            if batch_idx % log_interval == 0:
+                elapsed_total = time.time() - training_start
+                batches_sec = total_batches_done / max(1, elapsed_total)
+                eta_epoch = (batches_per_epoch - batch_idx) / max(0.01, batches_sec)
+                if writer:
+                    step = epoch * batches_per_epoch + batch_idx
+                    writer.add_scalar('train/loss', loss.item(), step)
+                    writer.add_scalar('train/l1', l1.item(), step)
+                print(f'  [{batch_idx}/{batches_per_epoch}] '
+                      f'loss={loss.item():.4f} l1={l1.item():.4f} '
+                      f'perc={perc.item():.4f} equiv={equiv.item():.4f} '
+                      f'| {batches_sec:.1f} batch/s ETA={eta_epoch/60:.0f}min',
+                      flush=True)
+
+            now = time.time()
+            if (now - last_save_time) > args.save_interval_min * 60:
+                metrics = {'loss': total_loss / max(1, num_batches), 'l1': total_l1 / max(1, num_batches)}
+                path = save_checkpoint(model, optimizer, epoch, batch_idx, metrics, args.checkpoint_dir, 'latest')
+                last_save_time = now
+                print(f'  [auto-save] {path} (epoch {epoch+1}, batch {batch_idx})', flush=True)
+
         scheduler.step()
         elapsed = time.time() - t0
+        metrics = {
+            'loss': total_loss / max(1, num_batches),
+            'l1': total_l1 / max(1, num_batches),
+            'perceptual': total_perc / max(1, num_batches),
+            'equivariance': total_equiv / max(1, num_batches),
+        }
         print(f'  Epoch complete in {elapsed:.1f}s — '
               f'loss={metrics["loss"]:.4f} l1={metrics["l1"]:.4f}')
+
         if writer:
             writer.add_scalar('epoch/loss', metrics['loss'], epoch)
             writer.add_scalar('epoch/lr', scheduler.get_last_lr()[0], epoch)
 
+        save_checkpoint(model, optimizer, epoch, 0, metrics, args.checkpoint_dir, 'latest')
+        last_save_time = time.time()
+
         if (epoch + 1) % args.save_every == 0 or epoch == args.epochs - 1:
-            checkpoint_path = os.path.join(args.checkpoint_dir, f'checkpoint_{epoch + 1}.pt')
-            torch.save({
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'metrics': metrics,
-            }, checkpoint_path)
-            print(f'  Saved {checkpoint_path}')
+            save_checkpoint(model, optimizer, epoch, 0, metrics, args.checkpoint_dir, f'{epoch + 1}')
+            print(f'  Saved checkpoint_{epoch + 1}.pt')
+
+    if interrupted:
+        metrics = {'loss': total_loss / max(1, num_batches), 'l1': total_l1 / max(1, num_batches)}
+        path = save_checkpoint(model, optimizer, epoch, batch_idx, metrics, args.checkpoint_dir, 'interrupted')
+        print(f'  Saved interrupted checkpoint: {path}')
 
     if writer:
         writer.close()
-    print('\nTraining complete!')
-    print(f'Export to ONNX: python export_onnx.py --checkpoint {args.checkpoint_dir}/checkpoint_{args.epochs}.pt')
+
+    total_time = time.time() - training_start
+    print(f'\nTraining {"interrupted" if interrupted else "complete"}!')
+    print(f'Total time: {total_time/3600:.1f} hours')
+    print(f'Checkpoints: {args.checkpoint_dir}/')
+    print(f'Export: python export_onnx.py --checkpoint {args.checkpoint_dir}/checkpoint_latest.pt --output-dir ./exported')
 
 
 if __name__ == '__main__':
